@@ -13,8 +13,10 @@ from sklearn.metrics import (
     classification_report,
     ConfusionMatrixDisplay
 )
-
+from itertools import product
+import time
 import warnings
+from sklearn.cluster import KMeans
 
 warnings.filterwarnings(
     "ignore",
@@ -40,12 +42,8 @@ X = df.drop(columns=["attack_cat", "id"])
 y = df["attack_cat"].astype(str)
 
 categorical_features = ["proto", "state", "service"]
-numerical_features = [
-    c for c in X.columns
-    if c not in categorical_features
-]
 
-# Remove known perfectly redundant features, if present.
+# remove known redundant features
 redundant = [
     ("sbytes", "sloss"),
     ("dbytes", "dloss"),
@@ -59,17 +57,20 @@ drop_features = [
 
 X = X.drop(columns=drop_features)
 
-# Stratification preserves class proportions across the split.
-# Labels are used for splitting, not SOM training.
+numerical_features = [
+    c for c in X.columns
+    if c not in categorical_features
+]
+
+# stratification preserves class proportions across the split.
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
     test_size=0.20,
-    random_state=42,
+    random_state=1234,
     stratify=y
 )
 
-def signed_log(X):
-    return np.sign(X) * np.log1p(np.abs(X))
+def signed_log(X): return np.sign(X) * np.log1p(np.abs(X))
 
 numeric_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
@@ -105,61 +106,83 @@ X_tune, _, y_tune, _ = train_test_split(
 )
 
 def train_som():
-    rng = np.random.default_rng(seed=1234)
-    min_qe = 1_000_000
-    min_te = 1_000_000
+    min_score = 1_000_000
     best_som = None
 
+    sizes = [10, 15, 20, 25, 30]
+    learning_rates = [0.1, 0.3, 0.5, 0.7]
+    sigmas = [1.0, 2.0, 3.0, 5.0]
+    neighborhood_functions = [
+        "gaussian",
+        "mexican_hat",
+        "bubble",
+    ]
+    topologies = ["rectangular", "hexagonal"]
+
+    combinations = product(
+        sizes,
+        learning_rates,
+        sigmas,
+        neighborhood_functions,
+        topologies,
+    )
+
     results = []
-    for size in [10, 15, 20]:
-        for lr in [0.3, 0.5]:
-            for sigma in [1.0, 2.0, 3.0]:
-                print(f"Size: {size} Learning Rate: {lr} Sigma: {sigma}")
-                som = MiniSom(
-                    x=size, y=size,
-                    input_len=X_tune.shape[1],
-                    sigma=sigma,
-                    learning_rate=lr,
-                    neighborhood_function="gaussian",
-                    topology="rectangular",
-                    random_seed=1234,)
+    for size, lr, sigma, neighborhood, topology in combinations:
+        start = time.perf_counter()
+        som = MiniSom(
+            x=size, y=size,
+            input_len=X_tune.shape[1],
+            sigma=sigma,
+            learning_rate=lr,
+            neighborhood_function=neighborhood,
+            topology=topology,
+            random_seed=1234,)
 
-                som.random_weights_init(X_tune)
-                som.train_random(X_tune,
-                    num_iteration=30_000,
-                    verbose=False)
+        som.random_weights_init(X_tune)
+        som.train_random(X_tune,
+            num_iteration=30_000,
+            verbose=False)
 
-                # Evaluate on the same feature subset for comparison.
-                qe = som.quantization_error(X_tune)
+        # evaluate on the same feature subset for comparison.
+        qe = som.quantization_error(X_tune)
+        iter_time = time.perf_counter() - start
 
-                # Topographic error is more expensive, so use a subset.
-                te_idx = rng.choice(len(X_tune), size=min(2000, len(X_tune)), replace=False)
-                te = som.topographic_error(X_tune[te_idx])
+        print(f"Size: {size} Lr: {lr} Sigma: {sigma}",
+            f"NF: {neighborhood} Topology: {topology}",
+            f"QE: {qe:.4f} Time: {iter_time:.4f}\n")
 
-                results.append({
-                    "size": size,
-                    "learning_rate": lr,
-                    "sigma": sigma,
-                    "quantization_error": qe,
-                    "topographic_error": te,})
+        results.append({
+            "iteration_time": iter_time,
+            "size": size,
+            "learning_rate": lr,
+            "sigma": sigma,
+            "neighborhood_function":neighborhood,
+            "topology":topology,
+            "quantization_error": qe,})
 
-                if qe < min_qe and te < min_te:
-                    min_qe = qe
-                    min_te = te
-                    best_som = som
+        if qe < min_score:
+            min_score = qe
+            best_som = som
 
-    results_df = pd.DataFrame(results).sort_values(["quantization_error", "topographic_error"])
-    results_df.to_csv("results/som_results.csv", index=False)
+    results_df = pd.DataFrame(results).sort_values(["quantization_error"])
+    # results_df.to_csv("results/som_results.csv", index=False)
     print(results_df.to_string(index=False))
 
+    best_som.random_weights_init(X_train_processed)
+    best_som.train_random(X_train_processed,
+        num_iteration=20_000, verbose=True)
+
     joblib.dump(best_som, "models/best_som_model.pkl")
+
+    # cluster_codebook_vectors()
+    # label_clusters()
 
     label_neurons()
 
 def label_neurons():
     som = joblib.load("models/best_som_model.pkl")
 
-    # Label the neurons using training labels
     neuron_labels = {}
 
     for i in range(som.get_weights().shape[0]):
@@ -170,7 +193,7 @@ def label_neurons():
         bmu = som.winner(x)
         neuron_labels[bmu].append(label)
 
-    # Assign each neuron its majority class
+    # assign each neuron its majority class
     neuron_classes = {}
 
     for bmu, labels in neuron_labels.items():
@@ -180,17 +203,110 @@ def label_neurons():
     joblib.dump(neuron_classes, "models/neuron_classes.pkl")
 
 
-def predict(x):
+
+def cluster_codebook_vectors():
+    som = joblib.load("models/best_som_model.pkl")
+    weights = som.get_weights()
+    codebook_vectors = weights.reshape(-1, weights.shape[-1])
+
+    kmeans = KMeans(
+        n_clusters=10,
+        random_state=1234,
+        n_init=10,
+    )
+
+    cluster_ids = kmeans.fit_predict(codebook_vectors)
+    # restore the SOM's two-dimensional grid layout
+    # cluster_map = cluster_ids.reshape(weights.shape[:2])
+
+    joblib.dump(kmeans, "models/codebook_kmeans.pkl")
+
+def label_clusters():
+    som = joblib.load("models/best_som_model.pkl")
+    kmeans = joblib.load("models/codebook_kmeans.pkl")
+
+    weights = som.get_weights()
+    codebook_vectors = weights.reshape(-1, weights.shape[-1])
+    cluster_ids = kmeans.predict(codebook_vectors)
+    cluster_map = cluster_ids.reshape(weights.shape[:2])
+
+    # collect training labels assigned to each cluster
+    cluster_labels = {
+        cluster: []
+        for cluster in range(kmeans.n_clusters)
+    }
+
+    for x, label in zip(X_train_processed, y_train):
+        bmu = som.winner(x)
+        cluster = cluster_map[bmu]
+        cluster_labels[cluster].append(label)
+
+    # label each cluster using its majority class
+    cluster_classes = {}
+    for cluster, labels in cluster_labels.items():
+        if labels:
+            cluster_classes[cluster] = Counter(labels).most_common(1)[0][0]
+
+    joblib.dump(cluster_classes, "models/cluster_classes.pkl")
+
+def predict_cb(X):
+    som = joblib.load("models/best_som_model.pkl")
+    kmeans = joblib.load("models/codebook_kmeans.pkl")
+    cluster_classes = joblib.load("models/cluster_classes.pkl")
+
+    cluster_map = kmeans.labels_.reshape(
+        som.get_weights().shape[:2]
+    )
+
+    predictions = []
+
+    for x in X:
+        bmu = som.winner(x)
+        cluster = cluster_map[bmu]
+
+        if cluster not in cluster_classes:
+            raise ValueError(
+                f"Cluster {cluster} has no assigned attack label."
+            )
+
+        predictions.append(cluster_classes[cluster])
+
+    return predictions
+
+def predict(X):
     som = joblib.load("models/best_som_model.pkl")
     neuron_classes = joblib.load("models/neuron_classes.pkl")
-    bmu = som.winner(x)
 
-    return neuron_classes.get(bmu)
+    weights = som.get_weights()
+    labelled_neurons = list(neuron_classes.keys())
+
+    if not labelled_neurons:
+        raise ValueError("No labelled SOM neurons found.")
+
+    y_pred = []
+    for x in X:
+        bmu = som.winner(x)
+
+        if bmu in neuron_classes:
+            y_pred.append(neuron_classes[bmu])
+            continue
+
+        # find the labelled neuron whose weight is closest to x.
+        nearest = min(
+            labelled_neurons,
+            key=lambda n: np.linalg.norm(x - weights[n[0], n[1]])
+        )
+
+        y_pred.append(neuron_classes[nearest])
+
+    return y_pred
 
 def eval_models():
     try:
         y_pred_som = predict(X_test_processed)
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         print("Error: best model files not found, please run model discovery steps!")
         return
 

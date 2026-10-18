@@ -38,7 +38,7 @@ df = df.loc[df["attack_cat"].notna()].copy()
 X = df.drop(columns=["attack_cat", "id"])
 y = LabelEncoder().fit_transform(df["attack_cat"].astype(str))
 
-# Remove known perfectly redundant features, if present.
+# remove known redundant features
 redundant = [
     ("sbytes", "sloss"),
     ("dbytes", "dloss"),
@@ -58,7 +58,7 @@ numerical_features = [
     if c not in categorical_features
 ]
 
-# Stratification preserves class proportions across the split.
+# stratification preserves class proportions across the split.
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
     test_size=0.20,
@@ -80,7 +80,7 @@ rf_numeric_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
 ])
 
-# Shared categorical preprocessing.
+# shared categorical preprocessing.
 categorical_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="most_frequent")),
     ("encoder", OneHotEncoder(
@@ -99,8 +99,6 @@ rf_preprocessor = ColumnTransformer([
     ("cat", categorical_pipeline, categorical_features),
 ])
 
-# Tune on a subset of the training data.
-# Keep the test set completely separate.
 X_tune, _, y_tune, _ = train_test_split(
     X_train,
     y_train,
